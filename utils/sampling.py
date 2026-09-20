@@ -106,7 +106,15 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
                     mod_complex_graph_batch = copy.deepcopy(complex_graph_batch).to_data_list()
                     for batch in mod_complex_graph_batch:
                         crop_beyond(batch, tr_sigma * 3 + model_args.crop_beyond, model_args.all_atoms)
-                    mod_complex_graph_batch = Batch.from_data_list(mod_complex_graph_batch)
+                    # [sdaa-adapt] torch_geometric decides where to build the
+                    # auxiliary `batch`/`ptr` vectors from `value.is_cuda`
+                    # (torch_geometric/data/collate.py). On a non-CUDA accelerator
+                    # that probe never fires, so the re-batched graph keeps its
+                    # `batch` on CPU while every real attribute sits on the device --
+                    # the model then fails on `batch[edge_index[0]]`. Move the
+                    # re-batched graph explicitly, the same way the confidence
+                    # branch below already does.
+                    mod_complex_graph_batch = Batch.from_data_list(mod_complex_graph_batch).to(device)
                 else:
                     mod_complex_graph_batch = complex_graph_batch
 

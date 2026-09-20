@@ -32,6 +32,7 @@ from utils.diffusion_utils import t_to_sigma as t_to_sigma_compl, get_t_schedule
 from utils.inference_utils import InferenceDataset, set_nones
 from utils.sampling import randomize_position, sampling
 from utils.utils import get_model
+from utils.accelerator import get_device
 from utils.visualise import PDBFile
 from tqdm import tqdm
 
@@ -149,7 +150,9 @@ def main(args):
         with open(f'{args.confidence_model_dir}/model_parameters.yml') as f:
             confidence_args = Namespace(**yaml.full_load(f))
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # [sdaa-adapt] torch.cuda.is_available() reports False on Teco SDAA builds
+    # even though the accelerator is present; probe every backend instead.
+    device = get_device()
     logger.info(f"DiffDock will run on {device}")
 
     if args.protein_ligand_csv is not None:

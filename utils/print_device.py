@@ -4,9 +4,13 @@ import torch
 
 
 def get_default_device():
-    if torch.cuda.is_available():
-        return torch.device('cuda')
-    elif torch.backends.mps.is_available():
+    # [sdaa-adapt] SDAA builds report CUDA as unavailable, so consult the shared
+    # accelerator probe before falling back to MPS/CPU.
+    from utils.accelerator import get_device as _get_accel_device
+    accel_device = _get_accel_device()
+    if accel_device.type != 'cpu':
+        return accel_device
+    if torch.backends.mps.is_available():
         # Not all operations implemented in MPS yet
         use_mps = os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "0") == "1"
         if use_mps:

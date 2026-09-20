@@ -25,6 +25,7 @@ from datasets.pdbbind import PDBBind
 from utils.diffusion_utils import t_to_sigma as t_to_sigma_compl, get_t_schedule
 from utils.sampling import randomize_position, sampling
 from utils.utils import get_model, ExponentialMovingAverage
+from utils.accelerator import get_device, empty_cache
 from utils.visualise import PDBFile
 from tqdm import tqdm
 
@@ -234,7 +235,8 @@ if __name__ == '__main__':
 
     if args.num_cpu is not None:
         torch.set_num_threads(args.num_cpu)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # [sdaa-adapt] backend-agnostic device probe (see utils/accelerator.py)
+    device = get_device()
     test_dataset = get_dataset(args, score_model_args)
     test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False)
     if args.confidence_model_dir is not None:
@@ -345,7 +347,8 @@ if __name__ == '__main__':
         gnina_metrics = {}
 
     for idx, orig_complex_graph in tqdm(enumerate(test_loader)):
-        torch.cuda.empty_cache()
+        # [sdaa-adapt] release memory on the active accelerator
+        empty_cache()
 
         if confidence_model is not None and not (confidence_args.use_original_model_cache or confidence_args.transfer_weights) \
                 and orig_complex_graph.name[0] not in confidence_complex_dict.keys():

@@ -1,0 +1,254 @@
+diff --git a/evaluate.py b/evaluate.py
+index b96f622..5b37bc8 100644
+--- a/evaluate.py
++++ b/evaluate.py
+@@ -25,6 +25,7 @@ from datasets.pdbbind import PDBBind
+ from utils.diffusion_utils import t_to_sigma as t_to_sigma_compl, get_t_schedule
+ from utils.sampling import randomize_position, sampling
+ from utils.utils import get_model, ExponentialMovingAverage
++from utils.accelerator import get_device, empty_cache
+ from utils.visualise import PDBFile
+ from tqdm import tqdm
+ 
+@@ -234,7 +235,8 @@ if __name__ == '__main__':
+ 
+     if args.num_cpu is not None:
+         torch.set_num_threads(args.num_cpu)
+-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
++    # [sdaa-adapt] backend-agnostic device probe (see utils/accelerator.py)
++    device = get_device()
+     test_dataset = get_dataset(args, score_model_args)
+     test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False)
+     if args.confidence_model_dir is not None:
+@@ -345,7 +347,8 @@ if __name__ == '__main__':
+         gnina_metrics = {}
+ 
+     for idx, orig_complex_graph in tqdm(enumerate(test_loader)):
+-        torch.cuda.empty_cache()
++        # [sdaa-adapt] release memory on the active accelerator
++        empty_cache()
+ 
+         if confidence_model is not None and not (confidence_args.use_original_model_cache or confidence_args.transfer_weights) \
+                 and orig_complex_graph.name[0] not in confidence_complex_dict.keys():
+diff --git a/inference.py b/inference.py
+index c56941f..efcbec9 100644
+--- a/inference.py
++++ b/inference.py
+@@ -32,6 +32,7 @@ from utils.diffusion_utils import t_to_sigma as t_to_sigma_compl, get_t_schedule
+ from utils.inference_utils import InferenceDataset, set_nones
+ from utils.sampling import randomize_position, sampling
+ from utils.utils import get_model
++from utils.accelerator import get_device
+ from utils.visualise import PDBFile
+ from tqdm import tqdm
+ 
+@@ -149,7 +150,9 @@ def main(args):
+         with open(f'{args.confidence_model_dir}/model_parameters.yml') as f:
+             confidence_args = Namespace(**yaml.full_load(f))
+ 
+-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
++    # [sdaa-adapt] torch.cuda.is_available() reports False on Teco SDAA builds
++    # even though the accelerator is present; probe every backend instead.
++    device = get_device()
+     logger.info(f"DiffDock will run on {device}")
+ 
+     if args.protein_ligand_csv is not None:
+diff --git a/utils/accelerator.py b/utils/accelerator.py
+new file mode 100644
+index 0000000..d6ef089
+--- /dev/null
++++ b/utils/accelerator.py
+@@ -0,0 +1,95 @@
++"""[sdaa-adapt] Accelerator-agnostic device helpers.
++
++Teco SDAA builds of PyTorch expose the accelerator through torch.sdaa while
++torch.cuda stays importable but reports is_available() == False. Upstream
++DiffDock only probes torch.cuda, so every device decision silently falls back
++to CPU on SDAA. Routing the probes through this module leaves the CUDA code
++path unchanged and makes SDAA a first-class backend.
++"""
++import torch
++
++_SDAA = getattr(torch, "sdaa", None)
++
++
++def _sdaa_ok():
++    return _SDAA is not None and _SDAA.is_available()
++
++
++def accel_available():
++    """True when a usable accelerator backend (CUDA or SDAA) is present."""
++    return torch.cuda.is_available() or _sdaa_ok()
++
++
++def device_count():
++    if torch.cuda.is_available():
++        return torch.cuda.device_count()
++    if _sdaa_ok():
++        return _SDAA.device_count()
++    return 0
++
++
++def get_device():
++    """torch.device for the active accelerator, CPU when there is none."""
++    if torch.cuda.is_available():
++        return torch.device("cuda")
++    if _sdaa_ok():
++        return torch.device("sdaa")
++    return torch.device("cpu")
++
++
++def empty_cache():
++    """Drop cached accelerator memory; no-op on CPU."""
++    if torch.cuda.is_available():
++        torch.cuda.empty_cache()
++    elif _sdaa_ok():
++        _SDAA.empty_cache()
++
++
++def jit_script_available():
++    """[sdaa-adapt] True only when torch.jit.script really compiles.
++
++    Some vendor PyTorch builds ship TorchScript as a no-op: torch.jit.script
++    hands back its argument unchanged (and torch.jit.is_jit_enabled may not even
++    exist). Probe the behaviour once instead of trusting the module to be there.
++    """
++
++    def _probe(x):
++        return x + 1
++
++    try:
++        scripted = torch.jit.script(_probe)
++    except Exception:
++        return False
++    return isinstance(scripted, (torch.jit.ScriptModule, torch.jit.ScriptFunction))
++
++
++def apply_platform_defaults():
++    """[sdaa-adapt] Apply the library defaults this backend needs.
++
++    e3nn builds its tensor products through FX codegen
++    (e3nn/util/codegen/_mixin.py) and asserts that torch.jit.script returned a
++    ScriptModule. On a build whose torch.jit is stubbed that assert fires while
++    constructing the very first o3.FullyConnectedTensorProduct, so not a single
++    score-model layer can be built. e3nn ships an official switch for exactly
++    this case: jit_script_fx=False registers the fx.GraphModule directly and
++    runs it eagerly, which is numerically identical on both backends.
++
++    Returns True when the workaround was applied, False when nothing was needed.
++    """
++    if jit_script_available():
++        return False
++    try:
++        import e3nn
++    except ImportError:
++        return False
++    if not hasattr(e3nn, "get_optimization_defaults"):
++        return False
++    if not e3nn.get_optimization_defaults().get("jit_script_fx", False):
++        return False
++    e3nn.set_optimization_defaults(jit_script_fx=False)
++    return True
++
++
++# Import-time call: every entry point that touches this module is covered no
++# matter where the accelerator import sits in its import list.
++apply_platform_defaults()
+diff --git a/utils/inference_utils.py b/utils/inference_utils.py
+index ac11ec8..c243dcc 100644
+--- a/utils/inference_utils.py
++++ b/utils/inference_utils.py
+@@ -9,6 +9,7 @@ import esm
+ 
+ from datasets.process_mols import generate_conformer, read_molecule, get_lig_graph_with_matching, moad_extract_receptor_structure
+ from datasets.parse_chi import aa_idx2aa_short, get_onehot_sequence
++from utils.accelerator import accel_available, get_device, empty_cache
+ 
+ 
+ def get_sequences_from_pdbfile(file_path):
+@@ -72,8 +73,9 @@ def compute_ESM_embeddings(model, alphabet, labels, sequences):
+     with torch.no_grad():
+         for batch_idx, (labels, strs, toks) in enumerate(data_loader):
+             print(f"Processing {batch_idx + 1} of {len(batches)} batches ({toks.size(0)} sequences)")
+-            if torch.cuda.is_available():
+-                toks = toks.to(device="cuda", non_blocking=True)
++            # [sdaa-adapt] follow whichever accelerator is active (CUDA or SDAA)
++            if accel_available():
++                toks = toks.to(device=get_device(), non_blocking=True)
+ 
+             out = model(toks, repr_layers=repr_layers, return_contacts=False)
+             representations = {layer: t.to(device="cpu") for layer, t in out["representations"].items()}
+@@ -103,7 +105,8 @@ def generate_ESM_structure(model, filename, sequence):
+                 for p in model.parameters():
+                     if p.grad is not None:
+                         del p.grad  # free some memory
+-                torch.cuda.empty_cache()
++                # [sdaa-adapt] release memory on the active accelerator
++                empty_cache()
+                 chunk_size = chunk_size // 2
+                 if chunk_size > 2:
+                     model.set_chunk_size(chunk_size)
+@@ -139,8 +142,9 @@ class InferenceDataset(Dataset):
+             model_location = "esm2_t33_650M_UR50D"
+             model, alphabet = pretrained.load_model_and_alphabet(model_location)
+             model.eval()
+-            if torch.cuda.is_available():
+-                model = model.cuda()
++            # [sdaa-adapt] backend-agnostic move for the ESM language model
++            if accel_available():
++                model = model.to(get_device())
+ 
+             protein_sequences = get_sequences(protein_files, protein_sequences)
+             labels, sequences = [], []
+@@ -166,7 +170,8 @@ class InferenceDataset(Dataset):
+         if None in protein_files:
+             print("generating missing structures with ESMFold")
+             model = esm.pretrained.esmfold_v1()
+-            model = model.eval().cuda()
++            # [sdaa-adapt] upstream hard-codes CUDA here; follow the active backend
++            model = model.eval().to(get_device())
+ 
+             for i in range(len(protein_files)):
+                 if protein_files[i] is None:
+diff --git a/utils/print_device.py b/utils/print_device.py
+index 2a055dd..1c7eefe 100644
+--- a/utils/print_device.py
++++ b/utils/print_device.py
+@@ -4,9 +4,13 @@ import torch
+ 
+ 
+ def get_default_device():
+-    if torch.cuda.is_available():
+-        return torch.device('cuda')
+-    elif torch.backends.mps.is_available():
++    # [sdaa-adapt] SDAA builds report CUDA as unavailable, so consult the shared
++    # accelerator probe before falling back to MPS/CPU.
++    from utils.accelerator import get_device as _get_accel_device
++    accel_device = _get_accel_device()
++    if accel_device.type != 'cpu':
++        return accel_device
++    if torch.backends.mps.is_available():
+         # Not all operations implemented in MPS yet
+         use_mps = os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "0") == "1"
+         if use_mps:
+diff --git a/utils/sampling.py b/utils/sampling.py
+index 78b2434..0ed7fa0 100644
+--- a/utils/sampling.py
++++ b/utils/sampling.py
+@@ -106,7 +106,15 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
+                     mod_complex_graph_batch = copy.deepcopy(complex_graph_batch).to_data_list()
+                     for batch in mod_complex_graph_batch:
+                         crop_beyond(batch, tr_sigma * 3 + model_args.crop_beyond, model_args.all_atoms)
+-                    mod_complex_graph_batch = Batch.from_data_list(mod_complex_graph_batch)
++                    # [sdaa-adapt] torch_geometric decides where to build the
++                    # auxiliary `batch`/`ptr` vectors from `value.is_cuda`
++                    # (torch_geometric/data/collate.py). On a non-CUDA accelerator
++                    # that probe never fires, so the re-batched graph keeps its
++                    # `batch` on CPU while every real attribute sits on the device --
++                    # the model then fails on `batch[edge_index[0]]`. Move the
++                    # re-batched graph explicitly, the same way the confidence
++                    # branch below already does.
++                    mod_complex_graph_batch = Batch.from_data_list(mod_complex_graph_batch).to(device)
+                 else:
+                     mod_complex_graph_batch = complex_graph_batch
+ 

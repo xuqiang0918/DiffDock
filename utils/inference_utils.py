@@ -9,6 +9,7 @@ import esm
 
 from datasets.process_mols import generate_conformer, read_molecule, get_lig_graph_with_matching, moad_extract_receptor_structure
 from datasets.parse_chi import aa_idx2aa_short, get_onehot_sequence
+from utils.accelerator import accel_available, get_device, empty_cache
 
 
 def get_sequences_from_pdbfile(file_path):
@@ -72,8 +73,9 @@ def compute_ESM_embeddings(model, alphabet, labels, sequences):
     with torch.no_grad():
         for batch_idx, (labels, strs, toks) in enumerate(data_loader):
             print(f"Processing {batch_idx + 1} of {len(batches)} batches ({toks.size(0)} sequences)")
-            if torch.cuda.is_available():
-                toks = toks.to(device="cuda", non_blocking=True)
+            # [sdaa-adapt] follow whichever accelerator is active (CUDA or SDAA)
+            if accel_available():
+                toks = toks.to(device=get_device(), non_blocking=True)
 
             out = model(toks, repr_layers=repr_layers, return_contacts=False)
             representations = {layer: t.to(device="cpu") for layer, t in out["representations"].items()}
@@ -103,7 +105,8 @@ def generate_ESM_structure(model, filename, sequence):
                 for p in model.parameters():
                     if p.grad is not None:
                         del p.grad  # free some memory
-                torch.cuda.empty_cache()
+                # [sdaa-adapt] release memory on the active accelerator
+                empty_cache()
                 chunk_size = chunk_size // 2
                 if chunk_size > 2:
                     model.set_chunk_size(chunk_size)
@@ -139,8 +142,9 @@ class InferenceDataset(Dataset):
             model_location = "esm2_t33_650M_UR50D"
             model, alphabet = pretrained.load_model_and_alphabet(model_location)
             model.eval()
-            if torch.cuda.is_available():
-                model = model.cuda()
+            # [sdaa-adapt] backend-agnostic move for the ESM language model
+            if accel_available():
+                model = model.to(get_device())
 
             protein_sequences = get_sequences(protein_files, protein_sequences)
             labels, sequences = [], []
@@ -166,7 +170,8 @@ class InferenceDataset(Dataset):
         if None in protein_files:
             print("generating missing structures with ESMFold")
             model = esm.pretrained.esmfold_v1()
-            model = model.eval().cuda()
+            # [sdaa-adapt] upstream hard-codes CUDA here; follow the active backend
+            model = model.eval().to(get_device())
 
             for i in range(len(protein_files)):
                 if protein_files[i] is None:
