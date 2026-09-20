@@ -301,6 +301,22 @@ def get_lig_graph(mol, complex_graph):
     return
 
 
+def restore_legacy_remove_hs_semantics(mol):
+    """[upstream] restore the pre-2024.03 rdkit `RemoveHs` bookkeeping.
+
+    Newer rdkit keeps the removed hydrogens in `implicitValence` instead of moving them
+    into `NumExplicitHs`, which shifts the valence columns of `lig_atom_featurizer`.
+    Carry them over and freeze, matching the pinned rdkit==2022.03.3 values (where this
+    is a no-op, `GetNumImplicitHs()` already being 0).
+    """
+    for atom in mol.GetAtoms():
+        n_implicit = atom.GetNumImplicitHs()
+        atom.SetNoImplicit(True)
+        if n_implicit:
+            atom.SetNumExplicitHs(atom.GetNumExplicitHs() + n_implicit)
+    return mol
+
+
 def generate_conformer(mol):
     ps = AllChem.ETKDGv2()
     failures, id = 0, -1
@@ -366,6 +382,9 @@ def get_lig_graph_with_matching(mol_, complex_graph, popsize, maxiter, matching,
             mol_rdkit = mols[np.argmin(rmsds)]
             if i == 0:
                 complex_graph.rmsd_matching = min(rmsds)
+                # [upstream] keep the ligand features version-independent
+                if remove_hs:
+                    mol_rdkit = restore_legacy_remove_hs_semantics(mol_rdkit)
                 get_lig_graph(mol_rdkit, complex_graph)
             else:
                 if torch.is_tensor(complex_graph['ligand'].pos):
@@ -374,7 +393,10 @@ def get_lig_graph_with_matching(mol_, complex_graph, popsize, maxiter, matching,
 
     else:  # no matching
         complex_graph.rmsd_matching = 0
-        if remove_hs: mol_ = RemoveHs(mol_)
+        if remove_hs:
+            mol_ = RemoveHs(mol_)
+            # [upstream] keep the ligand features version-independent
+            mol_ = restore_legacy_remove_hs_semantics(mol_)
         get_lig_graph(mol_, complex_graph)
 
     edge_mask, mask_rotate = get_transformation_mask(complex_graph)
